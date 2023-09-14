@@ -37,6 +37,7 @@ def main():
     logger.log("creating data loader...")
     data = load_data(
         data_dir=args.data_dir,
+        json_list=args.json_list,
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,

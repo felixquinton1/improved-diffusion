@@ -69,7 +69,8 @@ class Upsample(nn.Module):
         assert x.shape[1] == self.channels
         if self.dims == 3:
             x = F.interpolate(
-                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
+                # x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest" #base
+                x, (x.shape[2] * 2, x.shape[3] * 2, x.shape[4] * 2), mode="nearest" #mine
             )
         else:
             x = F.interpolate(x, scale_factor=2, mode="nearest")
@@ -93,7 +94,8 @@ class Downsample(nn.Module):
         self.channels = channels
         self.use_conv = use_conv
         self.dims = dims
-        stride = 2 if dims != 3 else (1, 2, 2)
+        # stride = 2 if dims != 3 else (1, 2, 2) #original
+        stride = 2 if dims != 3 else (2, 2, 2) #mine
         if use_conv:
             self.op = conv_nd(dims, channels, channels, 3, stride=stride, padding=1)
         else:
@@ -484,6 +486,7 @@ class UNetModel(nn.Module):
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
+
         for module in self.output_blocks:
             cat_in = th.cat([h, hs.pop()], dim=1)
             h = module(cat_in, emb)

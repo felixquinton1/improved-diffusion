@@ -1,14 +1,14 @@
 import copy
 import functools
 import os
-
+from scipy.ndimage import label
 import blobfile as bf
 import numpy as np
 import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
-
+from itertools import cycle
 from . import dist_util, logger
 from .fp16_util import (
     make_master_params,
@@ -19,7 +19,7 @@ from .fp16_util import (
 )
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-
+import torch
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -45,6 +45,7 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        do_bbox=False
     ):
         self.model = model
         self.diffusion = diffusion
@@ -65,6 +66,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.do_bbox = do_bbox
 
         self.step = 0
         self.resume_step = 0
@@ -158,7 +160,7 @@ class TrainLoop:
         self.master_params = make_master_params(self.model_params)
         self.model.convert_to_fp16()
 
-    def run_loop(self):
+    def run_loop2(self):
         while (
             not self.lr_anneal_steps
             or self.step + self.resume_step < self.lr_anneal_steps
@@ -177,18 +179,45 @@ class TrainLoop:
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
+    def run_loop(self):
+        while (
+                not self.lr_anneal_steps
+                or self.step + self.resume_step < self.lr_anneal_steps
+        ):
+            batch = next(self.data)
+            label = batch['label']
+            batch = batch['image']
+            if self.do_bbox:
+                concerned_pixels = bounding_boxes(label)
+            else:
+                concerned_pixels = clear_label(label)
+
+            cond = {}
+            self.run_step(batch, cond, concerned_pixels)
+            if self.step % self.log_interval == 0:
+                logger.dumpkvs()
+            if self.step % self.save_interval == 0:
+                self.save()
+                # Run for a finite amount of time in integration tests.
+                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+                    return
+            self.step += 1
+        # Save the last checkpoint if it wasn't already saved.
+        if (self.step - 1) % self.save_interval != 0:
+            self.save()
+    def run_step(self, batch, cond, concerned_pixels):
+        self.forward_backward(batch, cond, concerned_pixels)
         if self.use_fp16:
             self.optimize_fp16()
         else:
             self.optimize_normal()
         self.log_step()
 
-    def forward_backward(self, batch, cond):
+    def forward_backward(self, batch, cond, concerned_pixels):
         zero_grad(self.model_params)
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro_concerned_pixels = concerned_pixels[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
@@ -201,6 +230,7 @@ class TrainLoop:
                 self.ddp_model,
                 micro,
                 t,
+                micro_concerned_pixels,
                 model_kwargs=micro_cond,
             )
 
@@ -277,6 +307,7 @@ class TrainLoop:
                     filename = f"model{(self.step+self.resume_step):06d}.pt"
                 else:
                     filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
+                logger.log(f"saving model in {bf.join(get_blob_logdir(), filename)}")
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
@@ -312,6 +343,48 @@ class TrainLoop:
             return params
 
 
+def bounding_boxes(tensor):
+    # Get the number of dimensions in the tensor
+    num_dims = tensor.dim()
+
+    if num_dims != 4 and num_dims != 5:
+        raise ValueError("Input tensor must have 4 or 5 dimensions (B, C, H, W[, D])")
+
+    # Get the batch size and number of channels
+    batch_size, num_channels = tensor.shape[:2]
+
+    # Initialize an output tensor with zeros
+    output_tensor = torch.zeros_like(tensor)
+
+    for batch_idx in range(batch_size):
+        for channel_idx in range(num_channels):
+            # Convert the tensor to a NumPy array
+            tensor_np = tensor[batch_idx, channel_idx].cpu().numpy()
+
+            # Label connected components in the tensor
+            labeled_array, num_features = label(tensor_np == 2)
+
+            for label_idx in range(1, num_features + 1):
+                # Find the coordinates of the labeled component
+                component_coords = np.where(labeled_array == label_idx)
+                # Calculate the bounding box coordinates dynamically based on the number of dimensions
+                min_indices = [np.min(component_coords[dim]) for dim in range(num_dims - 2)]
+                max_indices = [np.max(component_coords[dim]) for dim in range(num_dims - 2)]
+
+                # Fill the bounding box region with 2 in the output tensor using direct indexing
+                slices = [slice(min_idx, max_idx + 1) for min_idx, max_idx in zip(min_indices, max_indices)]
+                output_tensor[batch_idx, channel_idx][slices] = 1
+
+    return output_tensor
+
+
+def clear_label(label):
+    # Create a new tensor of the same shape as the input tensor, initialized with zeros
+    result_tensor = torch.zeros_like(label)
+
+    # Replace values equal to 2 with 1
+    result_tensor[label == 2] = 1
+    return result_tensor
 def parse_resume_step_from_filename(filename):
     """
     Parse filenames of the form path/to/modelNNNNNN.pt, where NNNNNN is the

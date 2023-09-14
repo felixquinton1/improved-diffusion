@@ -3,7 +3,8 @@ Train a diffusion model on images.
 """
 
 import argparse
-
+import os
+from datetime import datetime
 from improved_diffusion import dist_util, logger
 from improved_diffusion.image_datasets import load_data
 from improved_diffusion.resample import create_named_schedule_sampler
@@ -15,12 +16,13 @@ from improved_diffusion.script_util import (
 )
 from improved_diffusion.train_util import TrainLoop
 
-
 def main():
     args = create_argparser().parse_args()
-
     dist_util.setup_dist()
-    logger.configure()
+
+    date = datetime.now().strftime("%d_%m_%Y_%H:%M")
+    logger.configure(dir=os.path.join(args.data_dir, "results", date))
+    os.makedirs(os.path.join(args.data_dir, "results", date), exist_ok=True)
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
@@ -32,10 +34,14 @@ def main():
     logger.log("creating data loader...")
     data = load_data(
         data_dir=args.data_dir,
+        json_list=args.json_list,
+        roi=args.roi,
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
+        debug=args.debug
     )
+
 
     logger.log("training...")
     TrainLoop(
@@ -54,12 +60,15 @@ def main():
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
+        do_bbox=args.do_bbox
     ).run_loop()
 
 
 def create_argparser():
     defaults = dict(
         data_dir="",
+        json_list="",
+        debug=False,
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
@@ -72,6 +81,8 @@ def create_argparser():
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
+        do_bbox=False,
+        roi=[64,64,64]
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
